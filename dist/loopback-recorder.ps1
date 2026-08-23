@@ -160,7 +160,7 @@ public static class LoopbackRec {
     return o;
   }
 
-  static void Drain(IAudioCaptureClient cap, WAVEFORMATEX fmt, double qpcPerSec, List<Packet> list, ref double firstT) {
+  static void Drain(IAudioCaptureClient cap, WAVEFORMATEX fmt, double qpcPerSec, List<Packet> list) {
     while (true) {
       uint n;
       int hr = cap.GetNextPacketSize(out n);
@@ -175,7 +175,6 @@ public static class LoopbackRec {
       float[] mono = ToMono(data, frames, fmt);
       double t = qpc / qpcPerSec;
       list.Add(new Packet { t0 = t, mono = mono, rate = (int)fmt.nSamplesPerSec });
-      if (t < firstT) firstT = t;
       cap.ReleaseBuffer(frames);
     }
   }
@@ -278,16 +277,32 @@ public static class LoopbackRec {
 
     Check(renderClient.Start());
     Check(capClient.Start());
-    Console.WriteLine("READY");
-    Console.Out.Flush();
 
     var lp = new List<Packet>();
     var mp = new List<Packet>();
+
+    // 等麦克风采到第一帧再 READY：把录音起点锚定在麦克风首帧 QPC
+    double t0 = 0;
+    bool haveT0 = false;
+    var swReady = Stopwatch.StartNew();
+    while (!haveT0) {
+      Drain(renderCap, renderFmt, qpcFreq, lp);
+      Drain(capCap, capFmt, qpcFreq, mp);
+      if (mp.Count > 0) {
+        t0 = mp[0].t0;
+        haveT0 = true;
+        break;
+      }
+      Thread.Sleep(5);
+      if (swReady.Elapsed.TotalSeconds > 10) break;
+    }
+    Console.WriteLine("READY");
+    Console.Out.Flush();
+
     var sw = Stopwatch.StartNew();
-    double firstT = double.MaxValue;
     while (true) {
-      Drain(renderCap, renderFmt, qpcFreq, lp, ref firstT);
-      Drain(capCap, capFmt, qpcFreq, mp, ref firstT);
+      Drain(renderCap, renderFmt, qpcFreq, lp);
+      Drain(capCap, capFmt, qpcFreq, mp);
       Thread.Sleep(5);
       if (sw.Elapsed.TotalSeconds >= duration) break;
       if (sw.Elapsed.TotalSeconds > duration + 15) break;
@@ -295,7 +310,6 @@ public static class LoopbackRec {
     Check(renderClient.Stop());
     Check(capClient.Stop());
 
-    double t0 = (firstT == double.MaxValue) ? 0.0 : firstT;
     int outLen = (int)(duration * 48000);
     var left = Resample(lp, t0, outLen);
     var right = Resample(mp, t0, outLen);

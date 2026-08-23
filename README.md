@@ -1,8 +1,8 @@
-# Audio-Latency
+# latency
 
 测量“音频输出 → 麦克风”延迟的 Windows 工具（以麦克风接收为准），适用于有线耳机/扬声器与蓝牙耳机的延迟测量。
 
-![alt text](image.png)
+![1787499468628](images/README/1787499468628.png)
 
 ## 快速开始
 

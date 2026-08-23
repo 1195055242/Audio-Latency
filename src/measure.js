@@ -36,7 +36,7 @@ async function measureLoopbackOnce({
   let readyWall;
   try {
     await rec.waitReady();
-    readyWall = performance.now(); // helper 已就绪、开始采集后的墙钟时刻
+    readyWall = performance.now(); // 近似录音起点（helper READY 后即开始采集）
   } catch (err) {
     rec.promise.catch(() => {}); // 避免未处理的 rejection
     throw new Error(`LOOPBACK_UNAVAILABLE: ${err.message}`);
@@ -55,7 +55,7 @@ async function measureLoopbackOnce({
   const micMs = ((micMatch.index + micMatch.offset) / sampleRate) * 1000;
   const roundTripMs = micMs - loopMs; // 延迟：输出→麦克风
 
-  // 含缓冲：播放启动→麦克风（用 ffplay 音频时钟对齐，录音起点近似取 READY 时刻）
+  // 含缓冲：播放启动(ffplay 音频时钟)→麦克风，与延迟同一次播放得出
   let chirpPlayWall;
   if (play.clockStart) {
     chirpPlayWall =

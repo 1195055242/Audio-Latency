@@ -291,44 +291,52 @@ async function guidedMeasure(cfg, args) {
       return;
     }
 
-    console.log(`#${no} 测量中（自动 5 次）...`);
+    console.log(`#${no} 测量中...`);
 
+    // 先试 loopback 5 次：每次播放同时得到 延迟 与 含缓冲
     let stats = null;
     let usedLoopback = false;
+    let delayMedian = null;
+    let buffMedian = null;
     try {
       stats = await measureRepeated({ ...cfg, mode: 'loopback' }, 5, (i, r) => {
         console.log(`  ${i}/5  延迟 ${r.valid ? fmt(r.roundTripMs) : '无效'}`);
       });
       usedLoopback = true;
+      const ok = stats.valid.filter((r) => (r.loopQuality ?? 0) >= 0.5);
+      if (ok.length) {
+        // 取“延迟中位数那次”的延迟与含缓冲
+        const sorted = [...ok].sort((a, b) => a.roundTripMs - b.roundTripMs);
+        const mid = sorted[Math.floor(sorted.length / 2)];
+        delayMedian = mid.roundTripMs;
+        buffMedian = mid.bufferedMs;
+      }
+      cleanupStats(stats);
     } catch (err) {
       if (!err.message.startsWith('LOOPBACK_UNAVAILABLE')) throw err;
     }
 
-    let delayMedian = null;
-    let buffMedian = null;
+    const loopbackOk =
+      usedLoopback && delayMedian != null && delayMedian >= 5 && delayMedian <= 500;
 
-    if (usedLoopback) {
-      // 同一次播放同时得到 延迟 与 含缓冲，各取中位数
-      const ok = stats.valid.filter((r) => (r.loopQuality ?? 0) >= 0.5);
-      delayMedian = medianOf(ok, null);
-      buffMedian = medianOf(ok, null, (r) => r.bufferedMs);
-      cleanupStats(stats);
-    }
-
-    // loopback 不可用或 5 次全无效时，回退到含缓冲模式
-    if (!usedLoopback || delayMedian == null) {
-      stats = await measureRepeated({ ...cfg, mode: 'mic' }, 5, (i, r) => {
-        console.log(`  ${i}/5  延迟(含缓冲) ${r.valid ? fmt(r.roundTripMs) : '无效'}`);
-      });
-      buffMedian = medianOf(stats.valid, null);
-      cleanupStats(stats);
-      if (offsetMs != null && buffMedian != null) {
-        delayMedian = buffMedian - offsetMs;
+    // 仅当 loopback 不可用（蓝牙）时才改测 5 次含缓冲；loopback 可用但无效时不追加测量
+    if (!usedLoopback) {
+      try {
+        stats = await measureRepeated({ ...cfg, mode: 'mic' }, 5, (i, r) => {
+          console.log(`  ${i}/5  延迟(含缓冲) ${r.valid ? fmt(r.roundTripMs) : '无效'}`);
+        });
+        buffMedian = medianOf(stats.valid, null);
+        cleanupStats(stats);
+        if (offsetMs != null && buffMedian != null) {
+          delayMedian = buffMedian - offsetMs;
+        }
+      } catch (err) {
+        console.log(`  含缓冲测量失败: ${err.message}`);
       }
     }
 
-    // 更新偏移（loopback 可用时）
-    if (usedLoopback && delayMedian != null && buffMedian != null) {
+    // 更新偏移（仅当 loopback 延迟合理）
+    if (loopbackOk && delayMedian != null && buffMedian != null) {
       offsetMs = buffMedian - delayMedian;
     }
 

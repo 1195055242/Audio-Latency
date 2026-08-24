@@ -332,11 +332,15 @@ async function guidedMeasure(cfg, args) {
       }
 
       if (delayMedian != null) {
-        // 基准的含缓冲：mic 单次，建立偏移（此后不再更新）
+        // 基准的含缓冲：mic 5 次取中位数，建立偏移（此后不再更新）
         try {
-          const micR = await measureOnce({ ...cfg, mode: 'mic' });
-          if (isValid(micR)) buffMedian = micR.roundTripMs;
-          cleanup(micR);
+          const stats = await measureRepeated({ ...cfg, mode: 'mic' }, 5, (i, r) => {
+            if (args.printLatency) {
+              console.log(`  ${i}/5  延迟(含缓冲) ${r.valid ? fmt(r.roundTripMs) : '无效'}`);
+            }
+          });
+          buffMedian = medianOf(stats.valid, null);
+          cleanupStats(stats);
         } catch (err) {
           console.log(`  含缓冲测量失败: ${err.message}`);
         }

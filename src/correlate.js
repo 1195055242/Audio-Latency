@@ -250,6 +250,68 @@ export function demeanNcc(signal, template, k) {
 }
 
 /**
+ * 按 ratio 对 signal 从 k 开始的片段做线性重采样，输出长度 = templateLength。
+ *
+ * ratio = 1 表示原样采样；ratio > 1 会把片段在时间轴上拉伸（降低离散频率），
+ * ratio < 1 则压缩（升高离散频率）。用于补偿录音端与模板端采样时钟不一致
+ * 造成的频偏，使波形相关（NCC）在存在 ±几十~几百 ppm 时钟偏移时仍能算准。
+ *
+ * @param {Float32Array|Array} signal
+ * @param {number} templateLength 输出样本数
+ * @param {number} k 片段在 signal 中的起点（样本）
+ * @param {number} ratio 重采样比（目标时间轴 / 原始时间轴）
+ * @returns {Float32Array}
+ */
+export function resampleSegment(signal, templateLength, k, ratio) {
+  const out = new Float32Array(templateLength);
+  for (let i = 0; i < templateLength; i++) {
+    const src = k + i * ratio;
+    const i0 = Math.floor(src);
+    const frac = src - i0;
+    const a = signal[i0] ?? 0;
+    const b = signal[i0 + 1] ?? 0;
+    out[i] = a + (b - a) * frac;
+  }
+  return out;
+}
+
+/**
+ * 在 k 附近搜索最佳重采样比（±ppm），使重采样后的片段与模板的 demeanNcc 最大。
+ *
+ * 播放端与录音端的采样时钟通常有几十~上百 ppm 的偏差，chirp 越长，末端相位
+ * 漂移越大，直接算 NCC 会偏低。这里在 ±ppm 范围内做一维搜索，返回补偿后的
+ * 最佳 ratio 与 quality，用于替代未补偿的 demeanNcc 作为质量判据。
+ *
+ * @param {Float32Array|Array} signal
+ * @param {Float32Array|Array} template
+ * @param {number} k 模板在 signal 中的起点（样本）
+ * @param {number} [ppm] 搜索范围（百万分之一，默认 200）
+ * @param {number} [steps] 搜索步数（默认 41，约 10ppm 分辨率）
+ * @returns {{ ratio: number, quality: number }}
+ */
+export function compensateRateOffsetNcc(signal, template, k, ppm = 200, steps = 41) {
+  // PHAT 定位在有采样率偏移时会向漂移方向偏几个样本，因此除搜索 ratio 外，
+  // 还要在 k 附近搜索一个小的整数样本修正量。
+  const maxLag = Math.min(16, Math.ceil(template.length * ppm * 1e-6) + 4);
+  let best = { ratio: 1, quality: demeanNcc(signal, template, k), kOffset: 0 };
+  const start = 1 - ppm * 1e-6;
+  const end = 1 + ppm * 1e-6;
+  for (let i = 0; i < steps; i++) {
+    const ratio = start + ((end - start) * i) / (steps - 1);
+    for (let dk = -maxLag; dk <= maxLag; dk++) {
+      const kk = k + dk;
+      if (kk < 0) continue;
+      const seg = resampleSegment(signal, template.length, kk, ratio);
+      const q = demeanNcc(seg, template, 0);
+      if (q > best.quality) {
+        best = { ratio, quality: q, kOffset: dk };
+      }
+    }
+  }
+  return best;
+}
+
+/**
  * 峰值显著性：峰值与本底（远离峰值区域的均方根）之比。
  *
  * 真实 chirp 匹配时峰值远高于相关序列本底；而纯噪声/静音/窄带干扰下

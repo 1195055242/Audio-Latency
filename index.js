@@ -11,7 +11,7 @@
 //   --ffplay <path>        ffplay.exe 路径（默认从 PATH / 环境变量 FFPLAY_PATH /
 //                          同 ffmpeg 目录查找）
 //   --input <device>       录音设备（麦克风）名
-//   --times <n>            测量次数（默认 5）
+//   --times <n>            测量次数（非引导默认 5，引导默认 3）
 //   --reference <ms>       参考基线（ms），用于计算输出链路净延迟
 //   --lead <seconds>       chirp 前导静音（默认 2.0，覆盖链路唤醒）
 //   --rate <hz>            采样率（默认 48000）
@@ -45,7 +45,7 @@ latency —— 测量音频输出 → 麦克风的声学延迟
   --ffplay <path>     ffplay.exe 路径（否则按 FFPLAY_PATH / PATH /
                       同 ffmpeg 目录查找）
   --input <device>    录音设备（麦克风）名，见 --list
-  --times <n>         测量次数（默认 5）
+  --times <n>         测量次数（非引导默认 5，引导默认 3）
   --reference <ms>    参考基线延迟（ms）。输出链路净延迟 = 测得值 - 基线
   --lead <seconds>    chirp 前导静音时长（默认 2.0，覆盖链路唤醒）
   --rate <hz>         采样率（默认 48000）
@@ -88,7 +88,7 @@ function parseArgs(argv) {
       case '--ffmpeg': args.ffmpeg = next(); break;
       case '--ffplay': args.ffplay = next(); break;
       case '--input': args.input = next(); break;
-      case '--times': args.times = Number(next()); break;
+      case '--times': args.times = Number(next()); args.timesSet = true; break;
       case '--reference': args.reference = Number(next()); break;
       case '--lead': args.lead = Number(next()); break;
       case '--rate': args.rate = Number(next()); break;
@@ -262,14 +262,16 @@ async function main() {
 
 /**
  * 引导式测量（通用，不限有线/蓝牙顺序）：
- *   第一副（有线基准）：loopback 3 次取中位数，mic 3 次取含缓冲中位数，偏移 = 含缓冲 − 延迟。
+ *   第一副（有线基准）：loopback 测 N 次取中位数，mic 测 N 次取含缓冲中位数，偏移 = 含缓冲 − 延迟。
  *   之后每副设备：
- *     - 先试 loopback（3 次），延迟合理直接采信；
- *     - loopback 不可用（如蓝牙）→ mic 3 次取含缓冲中位数，延迟 = 含缓冲 − 偏移。
+ *     - 先试 loopback（最多 N 次），延迟合理直接采信；
+ *     - loopback 不可用（如蓝牙）→ mic 测 N 次取含缓冲中位数，延迟 = 含缓冲 − 偏移。
+ *   N 默认 3，--times 可覆盖。
  *   每次列出：延迟；仅在 --print-latency 时附带含缓冲、偏移与每次测量的显著性/相关性。
  */
 async function guidedMeasure(cfg, args) {
   const keep = !!args.keep;
+  const tries = args.timesSet ? args.times : 3; // 引导式默认 3 次，--times 可覆盖
   const minQuality = cfg.minQuality ?? 0.15;
   const minSignificance = cfg.minSignificance ?? 20;
 
@@ -287,22 +289,6 @@ async function guidedMeasure(cfg, args) {
     }
   };
 
-  const medianOf = (results, extraOk, valueOf = (r) => r.roundTripMs) => {
-    const ms = results
-      .filter((r) => r.valid && (!extraOk || extraOk(r)))
-      .map(valueOf)
-      .filter((v) => v != null)
-      .sort((a, b) => a - b);
-    if (ms.length === 0) return null;
-    const mid = Math.floor(ms.length / 2);
-    return ms.length % 2 === 1 ? ms[mid] : (ms[mid - 1] + ms[mid]) / 2;
-  };
-
-  const cleanupStats = (s) => {
-    if (keep || !s) return;
-    for (const r of s.results || []) cleanup(r);
-  };
-
   // loopback 结果有效：mic 与 loop 两路都要可信，延迟还要在合理物理范围内
   const loopbackOk = (r) =>
     r.quality >= minQuality &&
@@ -311,46 +297,69 @@ async function guidedMeasure(cfg, args) {
     r.roundTripMs >= 5 &&
     r.roundTripMs <= 500;
 
-  // 尝试 loopback 最多 tries 次，返回延迟中位数；不可用/全部不合理返回 null
-  const tryLoopbackMedian = async (tries) => {
-    const loopResults = [];
+  // mic 结果有效：与 measureRepeated 相同的显著性 + 质量判据
+  const micOk = (r) =>
+    r.quality != null &&
+    r.significance != null &&
+    r.roundTripMs != null &&
+    r.quality >= minQuality &&
+    r.significance >= minSignificance;
+
+  /**
+   * 引导式测量带补测的多次采样：
+   *   目标是拿到 tries 个有效值；某次无效就补测 1 次。
+   *   连续 3 次无效则停止，并对已有有效值取平均；全部无效返回 null。
+   *   正常拿满 tries 个有效值时返回中位数（偶数取平均）。
+   */
+  const measureWithRetry = async ({ mode, tries, isValid, label }) => {
+    const validResults = [];
     let consecutiveBad = 0;
-    for (let i = 0; i < tries; i++) {
+    let attempt = 0;
+    const maxAttempts = tries * 2; // 防止“有效/无效交替”导致无限补测
+    while (validResults.length < tries && consecutiveBad < 3 && attempt < maxAttempts) {
+      attempt++;
       let r = null;
       try {
-        r = await measureOnce({ ...cfg, mode: 'loopback' });
+        r = await measureOnce({ ...cfg, mode });
       } catch (err) {
-        if (err.message.startsWith('LOOPBACK_UNAVAILABLE')) break;
-        throw err;
+        if (mode === 'loopback' && err.message.startsWith('LOOPBACK_UNAVAILABLE')) break;
+        if (mode === 'loopback') throw err;
+        // mic 模式的单次失败按无效处理，走补测逻辑
       }
-      const ok = loopbackOk(r);
+      const ok = r ? isValid(r) : false;
       if (ok) {
-        loopResults.push(r);
+        validResults.push(r);
         consecutiveBad = 0;
       } else {
         consecutiveBad++;
       }
       if (args.printLatency) {
-        console.log(`  ${i + 1}/${tries}  延迟 ${ok ? fmt(r.roundTripMs) : '无效'}  (${fmtSigCorr(r)})`);
+        const tag = attempt <= tries ? `${attempt}/${tries}` : `补测 ${attempt}/${tries}`;
+        const delay = ok ? fmt(r.roundTripMs) : '无效';
+        const head = label ? `${label} ${delay}` : `延迟 ${delay}`;
+        const metrics = r ? `(${fmtSigCorr(r)})` : '';
+        console.log(`  ${tag}  ${head}  ${metrics}`);
       }
-      cleanup(r);
-      if (consecutiveBad >= 3) break;
+      if (r) cleanup(r);
     }
-    if (loopResults.length === 0) return null;
-    const sorted = [...loopResults].sort((a, b) => a.roundTripMs - b.roundTripMs);
-    return sorted[Math.floor(sorted.length / 2)].roundTripMs;
+
+    if (validResults.length === 0) return null;
+    if (validResults.length === tries) {
+      const sorted = [...validResults].sort((a, b) => a.roundTripMs - b.roundTripMs);
+      const mid = Math.floor(sorted.length / 2);
+      return sorted.length % 2 === 1
+        ? sorted[mid].roundTripMs
+        : (sorted[mid - 1].roundTripMs + sorted[mid].roundTripMs) / 2;
+    }
+    // 提前停止（连续无效 / loopback 不可用 / 达到补测上限）：按已有有效值取平均
+    return validResults.reduce((sum, r) => sum + r.roundTripMs, 0) / validResults.length;
   };
 
-  // mic（含缓冲）测量 times 次，返回有效中位数
-  const runMicMedian = async (times, label) => {
-    const stats = await measureRepeated({ ...cfg, mode: 'mic' }, times, (i, r) => {
-      if (args.printLatency) {
-        console.log(`  ${i}/${times}  ${label} ${r.valid ? fmt(r.roundTripMs) : '无效'}  (${fmtSigCorr(r)})`);
-      }
-    });
-    cleanupStats(stats);
-    return medianOf(stats.valid, null);
-  };
+  const tryLoopbackMedian = (tries) =>
+    measureWithRetry({ mode: 'loopback', tries, isValid: loopbackOk, label: '' });
+
+  const runMicMedian = (times, label) =>
+    measureWithRetry({ mode: 'mic', tries: times, isValid: micOk, label });
 
   console.log('==================================================');
   console.log('第一次测量请把有线耳机/扬声器设为默认播放设备，作为基准参考。\n');
@@ -372,24 +381,24 @@ async function guidedMeasure(cfg, args) {
     const isBaseline = no === 1;
 
     if (isBaseline) {
-      // 第一副：必须是有线基准。loopback 最多 3 次，连续 3 次不合理即放弃。
-      delayMedian = await tryLoopbackMedian(3);
+      // 第一副：必须是有线基准。loopback 最多 tries 次，连续 3 次不合理即放弃。
+      delayMedian = await tryLoopbackMedian(tries);
 
       if (delayMedian != null) {
-        // 基准的含缓冲：mic 3 次取中位数，建立偏移（此后不再更新）
+        // 基准的含缓冲：mic tries 次取中位数，建立偏移（此后不再更新）
         try {
-          buffMedian = await runMicMedian(3, '延迟(含缓冲)');
+          buffMedian = await runMicMedian(tries, '延迟(含缓冲)');
         } catch (err) {
           console.log(`  含缓冲测量失败: ${err.message}`);
         }
         if (buffMedian != null) offsetMs = buffMedian - delayMedian;
       }
     } else {
-      // 后续设备：先试 loopback（3 次）；不可用/不合理时用 mic 3 次 + 已有偏移反推
-      delayMedian = await tryLoopbackMedian(3);
+      // 后续设备：先试 loopback（最多 tries 次）；不可用/不合理时用 mic tries 次 + 已有偏移反推
+      delayMedian = await tryLoopbackMedian(tries);
       if (delayMedian == null) {
         try {
-          buffMedian = await runMicMedian(3, '延迟(含缓冲)');
+          buffMedian = await runMicMedian(tries, '延迟(含缓冲)');
           if (offsetMs != null && buffMedian != null) {
             delayMedian = buffMedian - offsetMs;
           }

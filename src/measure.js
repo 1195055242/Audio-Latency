@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { generateChirp, writeWav, readWav, readWavChannels, DEFAULT_SAMPLE_RATE } from './signal.js';
-import { matchChirp } from './correlate.js';
+import { matchChirp, compensateRateOffsetNcc } from './correlate.js';
 import { startRecording, startPlayback, decodeAudio, findLoopbackHelper, startLoopbackRecording } from './ffmpeg.js';
 
 /**
@@ -21,6 +21,7 @@ async function measureLoopbackOnce({
   recPath,
   leadSilence,
   tailPad,
+  compensateRate = true,
 }) {
   const helperPath = findLoopbackHelper();
   if (!helperPath) {
@@ -75,9 +76,19 @@ async function measureLoopbackOnce({
   }
   const loopMatch = matchChirp(samples[0], template);
   const micMatch = matchChirp(samples[1], template);
+  const loopK = Math.round(loopMatch.index + loopMatch.offset);
+  const micK = Math.round(micMatch.index + micMatch.offset);
   const loopMs = ((loopMatch.index + loopMatch.offset) / sampleRate) * 1000;
   const micMs = ((micMatch.index + micMatch.offset) / sampleRate) * 1000;
   const roundTripMs = micMs - loopMs; // 延迟：输出→麦克风
+
+  // 采样时钟偏移补偿：在 ±200ppm 内搜索最佳重采样比，用补偿后的 NCC 作为相关质量
+  const loopQuality = compensateRate
+    ? compensateRateOffsetNcc(samples[0], template, loopK).quality
+    : loopMatch.quality;
+  const quality = compensateRate
+    ? compensateRateOffsetNcc(samples[1], template, micK).quality
+    : micMatch.quality;
 
   // 含缓冲：播放启动(ffplay 音频时钟)→麦克风，与延迟同一次播放得出
   let chirpPlayWall;
@@ -99,9 +110,9 @@ async function measureLoopbackOnce({
   return {
     roundTripMs,
     bufferedMs,
-    quality: micMatch.quality,
+    quality,
     significance: micMatch.significance,
-    loopQuality: loopMatch.quality,
+    loopQuality,
     loopMs,
     micMs,
     peakDb,
@@ -177,6 +188,7 @@ export async function measureOnce({
         recPath,
         leadSilence,
         tailPad,
+        compensateRate: !audioFile,
       });
     } catch (err) {
       if (mode === 'loopback' || !err.message.startsWith('LOOPBACK_UNAVAILABLE')) {
@@ -219,6 +231,11 @@ export async function measureOnce({
     }
 
     const match = matchChirp(recSamples, template);
+    // 采样时钟偏移补偿：chirp 模板在 ±200ppm 内搜索最佳重采样比，音频文件则保持原 NCC
+    const matchK = Math.round(match.index + match.offset);
+    const quality = audioFile
+      ? match.quality
+      : compensateRateOffsetNcc(recSamples, template, matchK).quality;
 
     // 录音峰值电平（dBFS），用于诊断音量过低 / 麦克风增益 / 回声消除抑制
     let peak = 0;
@@ -250,7 +267,7 @@ export async function measureOnce({
 
     return {
       roundTripMs,
-      quality: match.quality,
+      quality,
       significance: match.significance,
       peakDb,
       arrivalMs,

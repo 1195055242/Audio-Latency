@@ -12,6 +12,8 @@ import {
   demeanNcc,
   peakSignificance,
   matchChirp,
+  resampleSegment,
+  compensateRateOffsetNcc,
 } from '../src/correlate.js';
 
 test('fft: 逆变换能还原输入（round-trip）', () => {
@@ -149,4 +151,38 @@ test('无信号（静音/纯噪声/窄带谐波）不会被误判为有效', () 
     mHum.quality < 0.05 || mHum.significance < 35,
     `谐波干扰误判: q=${mHum.quality} s=${mHum.significance}`
   );
+});
+
+// 按 ratio 对模板做线性伸缩，模拟录音端采样时钟与模板不一致（ratio>1 表示录音端时钟更快）
+function stretchArray(src, ratio) {
+  const len = Math.round(src.length * ratio);
+  const out = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    const pos = i / ratio;
+    const i0 = Math.floor(pos);
+    const frac = pos - i0;
+    const a = src[i0] ?? 0;
+    const b = src[i0 + 1] ?? 0;
+    out[i] = a + (b - a) * frac;
+  }
+  return out;
+}
+
+test('compensateRateOffsetNcc 能补偿采样时钟偏移并提高相关', () => {
+  const rate = 48000;
+  const chirp = generateChirp({ sampleRate: rate, duration: 0.5, f0: 500, f1: 8000 });
+  const r = 1 + 150e-6; // 录音端采样时钟快 150ppm
+  const recChirp = stretchArray(chirp, r);
+  const offset = 8000;
+  const signal = new Float32Array(offset + recChirp.length + 4000);
+  signal.set(recChirp, offset);
+
+  const m = matchChirp(signal, chirp);
+  const k = Math.round(m.index + m.offset);
+  const plain = demeanNcc(signal, chirp, k);
+  const comp = compensateRateOffsetNcc(signal, chirp, k, 300, 61);
+
+  assert.ok(comp.quality > plain, `补偿后相关应更高: comp=${comp.quality.toFixed(3)} plain=${plain.toFixed(3)}`);
+  assert.ok(comp.quality > 0.9, `补偿后相关应接近 1: ${comp.quality.toFixed(3)}`);
+  assert.ok(Math.abs(comp.ratio - r) < 3e-5, `估计重采样比应接近 ${r}: ${comp.ratio}`);
 });

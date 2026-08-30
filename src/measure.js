@@ -275,18 +275,18 @@ export async function measureOnce({
  * 有效性判据（以"峰值显著性"为主，而非逐点波形相关）：
  *   - significance >= minSignificance（默认 20）：证明录音里确实有测试信号，
  *     即使波形被回声消除/降噪/蓝牙编码扭曲，其时频结构仍保留，PHAT 峰依然尖锐。
- *   - quality >= minQuality（默认 0.05）：辅助防线，排除"显著性虚高但波形完全无关"
+ *   - quality >= minQuality（默认 0.15）：辅助防线，排除"显著性虚高但波形完全无关"
  *     的窄带/谐波干扰（这类干扰的波形相关值接近 0）。
  * 两者都满足才判定为有效，不参与统计的测量标记为无效。
  *
  * @param {object} cfg
- * @param {number} [cfg.minQuality] 波形相关质量阈值（0..1，默认 0.05）
+ * @param {number} [cfg.minQuality] 波形相关质量阈值（0..1，默认 0.15）
  * @param {number} [cfg.minSignificance] 峰值显著性阈值（默认 20）
  * @param {function} [cfg.onProgress] (i, result) => void
  * @returns {Promise<{ results: Array, valid: Array, medianMs, meanMs, stdMs, minMs, maxMs, validCount, total }>}
  */
 export async function measureRepeated(cfg, times = 5, onProgress) {
-  const minQuality = cfg.minQuality ?? 0.05;
+  const minQuality = cfg.minQuality ?? 0.15;
   const minSignificance = cfg.minSignificance ?? 20;
   const results = [];
   for (let i = 0; i < times; i++) {
@@ -315,7 +315,7 @@ export async function measureRepeated(cfg, times = 5, onProgress) {
       r.quality >= minQuality &&
       r.significance >= minSignificance &&
       (!isLoopback ||
-        ((r.loopQuality ?? 0) >= 0.5 && r.roundTripMs >= 5 && r.roundTripMs <= 500));
+        ((r.loopQuality ?? 0) >= 0.9 && r.roundTripMs >= 5 && r.roundTripMs <= 500));
     results.push(r);
     if (onProgress) onProgress(i + 1, r);
   }

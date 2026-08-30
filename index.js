@@ -15,7 +15,7 @@
 //   --reference <ms>       参考基线（ms），用于计算输出链路净延迟
 //   --lead <seconds>       chirp 前导静音（默认 2.0，覆盖链路唤醒）
 //   --rate <hz>            采样率（默认 48000）
-//   --min-quality <q>      波形相关辅助阈值 0..1（默认 0.05）
+//   --min-quality <q>      波形相关辅助阈值 0..1（默认 0.15）
 //   --min-significance <s> 峰值显著性阈值（默认 20，主判据）
 //   --audio <file>         用音频文件代替 chirp 作为测试信号
 //   --playback-latency <ms> 播放器开销（ffplay/SDL 缓冲），从结果扣除
@@ -49,14 +49,14 @@ latency —— 测量音频输出 → 麦克风的声学延迟
   --reference <ms>    参考基线延迟（ms）。输出链路净延迟 = 测得值 - 基线
   --lead <seconds>    chirp 前导静音时长（默认 2.0，覆盖链路唤醒）
   --rate <hz>         采样率（默认 48000）
-  --min-quality <q>   波形相关辅助阈值 0..1（默认 0.05）
+  --min-quality <q>   波形相关辅助阈值 0..1（默认 0.15）
   --min-significance <s>  峰值显著性阈值（默认 20，主判据：录音中确有测试信号）
   --audio <file>      用音频文件（如简单音乐）代替 chirp 作为测试信号
   --playback-latency <ms>  播放器开销（ffplay/SDL 音频缓冲），从结果扣除
   --loopback         用 WASAPI loopback 双路测量“输出→麦克风”净延迟
   --no-loopback      旧模式：播放启动→麦克风（含播放缓冲，数值会偏大）
-  --no-guided        关闭引导式流程（默认开启：每副设备自动测 5 次取中位数）
-  --print-latency    打印每次测量的延迟过程行（默认不打印）
+  --no-guided        关闭引导式流程（默认开启：每副设备自动测 3 次取中位数）
+  --print-latency    打印每次测量的延迟过程行（默认不打印，含显著性/相关性）
   --keep              保留临时 WAV 文件（调试用）
   --no-pause          运行结束后不暂停（默认会“按任意键继续”，方便双击运行）
 
@@ -265,13 +265,20 @@ async function main() {
  *   第一副（有线基准）：loopback 3 次取中位数，mic 3 次取含缓冲中位数，偏移 = 含缓冲 − 延迟。
  *   之后每副设备：
  *     - 先试 loopback（3 次），延迟合理直接采信；
- *     - loopback 不可用（如蓝牙）→ mic 5 次取含缓冲中位数，延迟 = 含缓冲 − 偏移。
- *   每次列出：延迟、含缓冲、偏移。循环询问下一副。
+ *     - loopback 不可用（如蓝牙）→ mic 3 次取含缓冲中位数，延迟 = 含缓冲 − 偏移。
+ *   每次列出：延迟；仅在 --print-latency 时附带含缓冲、偏移与每次测量的显著性/相关性。
  */
 async function guidedMeasure(cfg, args) {
   const keep = !!args.keep;
-  const minQuality = cfg.minQuality ?? 0.05;
+  const minQuality = cfg.minQuality ?? 0.15;
   const minSignificance = cfg.minSignificance ?? 20;
+
+  const fmtSigCorr = (r) => {
+    const sig = r.significance != null ? `显著性 ${r.significance.toFixed(0)}` : '显著性 n/a';
+    const corr = r.quality != null ? `相关 ${(r.quality * 100).toFixed(0)}%` : '相关 n/a';
+    const loop = r.loopQuality != null ? `  loop相关 ${(r.loopQuality * 100).toFixed(0)}%` : '';
+    return `${sig}  ${corr}${loop}`;
+  };
 
   const cleanup = (r) => {
     if (keep || !r || !r.files) return;
@@ -300,7 +307,7 @@ async function guidedMeasure(cfg, args) {
   const loopbackOk = (r) =>
     r.quality >= minQuality &&
     (r.significance ?? Infinity) >= minSignificance &&
-    (r.loopQuality ?? 0) >= 0.5 &&
+    (r.loopQuality ?? 0) >= 0.9 &&
     r.roundTripMs >= 5 &&
     r.roundTripMs <= 500;
 
@@ -316,12 +323,15 @@ async function guidedMeasure(cfg, args) {
         if (err.message.startsWith('LOOPBACK_UNAVAILABLE')) break;
         throw err;
       }
-      if (loopbackOk(r)) {
+      const ok = loopbackOk(r);
+      if (ok) {
         loopResults.push(r);
         consecutiveBad = 0;
-        if (args.printLatency) console.log(`  ${i + 1}/${tries}  延迟 ${fmt(r.roundTripMs)}`);
       } else {
         consecutiveBad++;
+      }
+      if (args.printLatency) {
+        console.log(`  ${i + 1}/${tries}  延迟 ${ok ? fmt(r.roundTripMs) : '无效'}  (${fmtSigCorr(r)})`);
       }
       cleanup(r);
       if (consecutiveBad >= 3) break;
@@ -335,7 +345,7 @@ async function guidedMeasure(cfg, args) {
   const runMicMedian = async (times, label) => {
     const stats = await measureRepeated({ ...cfg, mode: 'mic' }, times, (i, r) => {
       if (args.printLatency) {
-        console.log(`  ${i}/${times}  ${label} ${r.valid ? fmt(r.roundTripMs) : '无效'}`);
+        console.log(`  ${i}/${times}  ${label} ${r.valid ? fmt(r.roundTripMs) : '无效'}  (${fmtSigCorr(r)})`);
       }
     });
     cleanupStats(stats);
@@ -375,11 +385,11 @@ async function guidedMeasure(cfg, args) {
         if (buffMedian != null) offsetMs = buffMedian - delayMedian;
       }
     } else {
-      // 后续设备：先试 loopback（3 次）；不可用/不合理时用 mic 5 次 + 已有偏移反推
+      // 后续设备：先试 loopback（3 次）；不可用/不合理时用 mic 3 次 + 已有偏移反推
       delayMedian = await tryLoopbackMedian(3);
       if (delayMedian == null) {
         try {
-          buffMedian = await runMicMedian(5, '延迟(含缓冲)');
+          buffMedian = await runMicMedian(3, '延迟(含缓冲)');
           if (offsetMs != null && buffMedian != null) {
             delayMedian = buffMedian - offsetMs;
           }
@@ -391,8 +401,10 @@ async function guidedMeasure(cfg, args) {
 
     console.log('  ----------------');
     const refParts = [];
-    if (buffMedian != null) refParts.push(`含缓冲 ${fmt(buffMedian)}`);
-    if (offsetMs != null) refParts.push(`偏移 ${fmt(offsetMs)}`);
+    if (args.printLatency) {
+      if (buffMedian != null) refParts.push(`含缓冲 ${fmt(buffMedian)}`);
+      if (offsetMs != null) refParts.push(`偏移 ${fmt(offsetMs)}`);
+    }
     if (delayMedian != null) {
       console.log(`  延迟: ${fmt(delayMedian)}${refParts.length ? `  (${refParts.join('，')})` : ''}`);
     } else {

@@ -41,27 +41,28 @@
 - `peakSignificance`：峰值/本底 RMS，判断“确实有 chirp”。
 - `matchChirp`：一站式：PHAT 定位 + 质量 + 显著性。
 
-有效性判据（`measureRepeated`）：`significance ≥ 20`（默认）且 `quality ≥ 0.05`；loopback 结果还要求 `loopQuality ≥ 0.5` 且延迟在 5~500ms 的合理范围内。
+有效性判据（`measureRepeated`）：`significance ≥ 20`（默认）且 `quality ≥ 0.15`；loopback 结果还要求 `loopQuality ≥ 0.9` 且延迟在 5~500ms 的合理范围内。
 
 ## 引导式流程（index.js `guidedMeasure`）
 
 1. **第一次测量用有线基准**：loopback 3 次得 `延迟`（有线 QPC 对齐可靠），mic 3 次得 `含缓冲`，`偏移 = 含缓冲 − 延迟`。
 2. **每副设备**：
    - 先试 loopback（最多 3 次，连续 3 次延迟不合理即放弃），合理才采信；
-   - 蓝牙等不可靠设备 → mic 模式 5 次，`延迟 = 含缓冲 − 偏移`。
-3. 过程行默认不打印（`--print-latency` 开启）；汇总只输出 `延迟`（括号列含缓冲、偏移）。
+   - 蓝牙等不可靠设备 → mic 模式 3 次，`延迟 = 含缓冲 − 偏移`。
+3. 过程行默认不打印（`--print-latency` 开启，含每次测量的显著性/相关性）；汇总只输出 `延迟`，仅在 `--print-latency` 时括号列出含缓冲、偏移。
 
 ## 关键文件
 
-| 文件 | 职责 |
-|---|---|
-| `index.js` | CLI、引导式交互、统计输出、暂停逻辑 |
-| `src/measure.js` | 测量编排、时间戳对齐、模式分发、多次统计 |
-| `src/correlate.js` | FFT、PHAT、峰值、质量、显著性 |
-| `src/signal.js` | chirp 生成、WAV 读写（含多声道） |
-| `src/ffmpeg.js` | ffmpeg/ffplay 进程、设备枚举、loopback helper、decodeAudio |
-| `loopback-recorder.ps1` | WASAPI loopback+麦克风双路录制 helper |
-| `test/correlate.test.js` | 信号检测单元测试 |
+
+| 文件                     | 职责                                                       |
+| ------------------------ | ---------------------------------------------------------- |
+| `index.js`               | CLI、引导式交互、统计输出、暂停逻辑                        |
+| `src/measure.js`         | 测量编排、时间戳对齐、模式分发、多次统计                   |
+| `src/correlate.js`       | FFT、PHAT、峰值、质量、显著性                              |
+| `src/signal.js`          | chirp 生成、WAV 读写（含多声道）                           |
+| `src/ffmpeg.js`          | ffmpeg/ffplay 进程、设备枚举、loopback helper、decodeAudio |
+| `loopback-recorder.ps1`  | WASAPI loopback+麦克风双路录制 helper                      |
+| `test/correlate.test.js` | 信号检测单元测试                                           |
 
 ## 打包（dist/）
 
@@ -70,9 +71,9 @@
 3. 复制 `node.exe` 并用 postject 注入 blob → `latency.exe`。
 4. `dist/` 附带 `loopback-recorder.ps1` 与 ffmpeg/ffplay + DLL，可独立分发。
 
-## 已知限制与坑
+## 已知限制
 
-- **蓝牙 A2DP 端点通常不支持 WASAPI loopback**（0x88890008），因此蓝牙走“含缓冲 − 偏移”差分路径。
+- **蓝牙 A2DP 端点可能不支持 WASAPI loopback**（0x88890008），此时走“含缓冲 − 偏移”差分路径。
 - ffplay 的 SDL/WASAPI 播放缓冲大且不可从外部时间戳观测，loopback 是唯一干净解法。
 - `IAudioClient` 的 COM vtable 必须按真实顺序完整声明，否则 HRESULT 错乱。
 - `clockStart` 在异步回调中填充，返回对象需用 getter 读取最新值。

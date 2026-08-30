@@ -1,5 +1,6 @@
 // measure.js —— 单次测量编排：生成测试信号 → 启动录音 → 启动播放 → 互相关求延迟
 
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { generateChirp, writeWav, readWav, readWavChannels, DEFAULT_SAMPLE_RATE } from './signal.js';
@@ -31,6 +32,7 @@ async function measureLoopbackOnce({
     outPath: recPath,
     duration,
     captureName: inputDevice,
+    sampleRate,
   });
 
   let readyWall = null;
@@ -39,11 +41,24 @@ async function measureLoopbackOnce({
     readyWall = performance.now();
   } catch (err) {
     rec.promise.catch(() => {}); // 避免未处理的 rejection
+    try { rec.child.kill(); } catch { /* ignore */ }
     throw new Error(`LOOPBACK_UNAVAILABLE: ${err.message}`);
   }
-  const play = startPlayback(ffplayPath, chirpPath, { observeClock: true });
-  await play.promise;
-  await rec.promise;
+
+  let play = null;
+  try {
+    play = startPlayback(ffplayPath, chirpPath, { observeClock: true });
+    await play.promise;
+    await rec.promise;
+  } catch (err) {
+    if (play) {
+      play.promise.catch(() => {});
+      try { play.child.kill(); } catch { /* ignore */ }
+    }
+    rec.promise.catch(() => {});
+    try { rec.child.kill(); } catch { /* ignore */ }
+    throw err;
+  }
 
   // 录音样本 0 的 Node 墙钟：用 helper 的 READY QPC 与 START_QPC 精确桥接
   let startWall = readyWall;
@@ -165,6 +180,9 @@ export async function measureOnce({
       });
     } catch (err) {
       if (mode === 'loopback' || !err.message.startsWith('LOOPBACK_UNAVAILABLE')) {
+        // 强制 loopback 或 loopback 内部错误：不再走 mic，清理已生成的临时信号
+        try { fs.unlinkSync(chirpPath); } catch { /* ignore */ }
+        try { fs.unlinkSync(recPath); } catch { /* ignore */ }
         throw err;
       }
       // auto 模式：loopback 不可用时回退到下面的旧模式继续执行
@@ -173,21 +191,22 @@ export async function measureOnce({
     }
   }
 
-  try {
-    // 1. 先启动录音
-    const rec = startRecording(ffmpegPath, {
-      device: inputDevice,
-      duration,
-      outPath: recPath,
-      sampleRate,
-    });
+  // 1. 先启动录音
+  const rec = startRecording(ffmpegPath, {
+    device: inputDevice,
+    duration,
+    outPath: recPath,
+    sampleRate,
+  });
 
-    // 2. 等麦克风真正开始采集（轮询文件增长），而非固定延时
+  let play = null;
+  try {
+    // 2. 等麦克风真正开始采集（轮询数据区增长），而非固定延时
     const recStarted = await rec.waitUntilStarted();
 
     // 3. 启动播放。以麦克风开始采集的时刻（recStarted.time）作为录音基准；
     //    用 ffplay 音频时钟（observeClock）在播放结束后精确推算 chirp 开始播放的时刻。
-    const play = startPlayback(ffplayPath, chirpPath, { observeClock: true });
+    play = startPlayback(ffplayPath, chirpPath, { observeClock: true });
 
     // 4. 等待两者结束
     await play.promise;
@@ -238,8 +257,15 @@ export async function measureOnce({
       tsOffsetMs,
       files: { chirp: chirpPath, rec: recPath },
     };
-  } finally {
-    // 清理临时文件（可选保留由调用方控制）
+  } catch (err) {
+    // 任一环节失败都要停掉两边的子进程，并吞掉随后产生的 rejection
+    if (play) {
+      play.promise.catch(() => {});
+      try { play.child.kill(); } catch { /* ignore */ }
+    }
+    rec.promise.catch(() => {});
+    try { rec.child.kill(); } catch { /* ignore */ }
+    throw err;
   }
 }
 
@@ -264,10 +290,32 @@ export async function measureRepeated(cfg, times = 5, onProgress) {
   const minSignificance = cfg.minSignificance ?? 20;
   const results = [];
   for (let i = 0; i < times; i++) {
-    const r = await measureOnce(cfg);
+    let r;
+    try {
+      r = await measureOnce(cfg);
+    } catch (err) {
+      // 强制 loopback 模式下不可用/失败应直接暴露错误，而不是被统计成“无效”
+      if (cfg.mode === 'loopback') throw err;
+      // 其他模式：单次失败（ffmpeg/ffplay 抖动、设备暂时不可用）不中断整批测量
+      r = {
+        roundTripMs: null,
+        quality: null,
+        significance: null,
+        peakDb: null,
+        files: {},
+        valid: false,
+        error: err.message,
+      };
+    }
+    const isLoopback = r.loopQuality != null;
     r.valid =
+      r.quality != null &&
+      r.significance != null &&
+      r.roundTripMs != null &&
       r.quality >= minQuality &&
-      (r.significance ?? Infinity) >= minSignificance;
+      r.significance >= minSignificance &&
+      (!isLoopback ||
+        ((r.loopQuality ?? 0) >= 0.5 && r.roundTripMs >= 5 && r.roundTripMs <= 500));
     results.push(r);
     if (onProgress) onProgress(i + 1, r);
   }
@@ -290,7 +338,9 @@ export async function measureRepeated(cfg, times = 5, onProgress) {
   }
 
   const mean = ms.reduce((a, b) => a + b, 0) / ms.length;
-  const variance = ms.reduce((a, b) => a + (b - mean) ** 2, 0) / ms.length;
+  const variance = ms.length > 1
+    ? ms.reduce((a, b) => a + (b - mean) ** 2, 0) / (ms.length - 1)
+    : 0;
   const median = ms.length % 2 === 1
     ? ms[(ms.length - 1) / 2]
     : (ms[ms.length / 2 - 1] + ms[ms.length / 2]) / 2;

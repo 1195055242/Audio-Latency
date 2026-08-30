@@ -147,22 +147,36 @@ export function startRecording(ffmpegPath, { device, duration, outPath, sampleRa
     });
   });
 
-  // 轮询输出文件大小，直到开始增长（麦克风开始采集）或超时
+  // 轮询输出文件大小，直到数据区开始增长（WAV header 会在开流时先写入 44 字节，
+  // 所以必须 > 44 才代表第一帧音频已落盘）或超时
   const waitUntilStarted = (timeoutMs = 15000, intervalMs = 10) =>
     new Promise((resolve, reject) => {
       const deadline = performance.now() + timeoutMs;
+      let done = false;
+      const onClose = () => {
+        if (done) return;
+        done = true;
+        reject(new Error(`ffmpeg 录音进程提前退出: ${stderr.trim()}`));
+      };
+      child.on('close', onClose);
       const tick = () => {
+        if (done) return;
         let size = 0;
         try {
           size = fs.statSync(outPath).size;
         } catch {
           /* 文件尚未创建 */
         }
-        if (size > 0) {
+        if (size > 44) {
+          done = true;
+          child.removeListener('close', onClose);
           resolve({ time: performance.now(), size });
           return;
         }
         if (performance.now() > deadline) {
+          done = true;
+          child.removeListener('close', onClose);
+          try { child.kill(); } catch { /* ignore */ }
           reject(new Error(`等待麦克风开始录音超时（${timeoutMs}ms）: ${stderr.trim()}`));
           return;
         }
@@ -287,7 +301,7 @@ export function findLoopbackHelper() {
 
 /**
  * 启动 WASAPI loopback 双路录音（channel 0 = 系统输出，channel 1 = 麦克风）。
- * 返回 { child, promise, waitReady }：
+ * 返回 { child, promise, waitReady, info }：
  *   waitReady = 等待 helper 输出 READY（采集已开始，可触发播放）
  *   promise   = 录音完成时 resolve
  *
@@ -296,12 +310,14 @@ export function findLoopbackHelper() {
  * @param {string} opts.outPath     输出 stereo WAV 路径
  * @param {number} opts.duration    录音时长（秒）
  * @param {string} [opts.captureName] 麦克风设备名（子串匹配，空则用系统默认）
+ * @param {number} [opts.sampleRate] 输出 WAV 采样率（默认 48000）
  */
-export function startLoopbackRecording({ helperPath, outPath, duration, captureName }) {
+export function startLoopbackRecording({ helperPath, outPath, duration, captureName, sampleRate = 48000 }) {
   const child = spawn(
     'powershell.exe',
     ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', helperPath,
-      '-Out', outPath, '-Duration', String(duration), '-CaptureName', captureName || ''],
+      '-Out', outPath, '-Duration', String(duration), '-CaptureName', captureName || '',
+      '-SampleRate', String(sampleRate)],
     { windowsHide: true }
   );
   let stderr = '';
@@ -335,18 +351,31 @@ export function startLoopbackRecording({ helperPath, outPath, duration, captureN
 
   const waitReady = (timeoutMs = 30000) =>
     new Promise((resolve, reject) => {
+      let done = false;
+      let timer = null;
+      const finishReady = () => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        resolve();
+      };
+      const fail = (err) => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        reject(err);
+      };
       if (info.readyPerf != null) {
         resolve();
         return;
       }
-      readyResolve = resolve;
-      const timer = setTimeout(
-        () => reject(new Error(`等待 loopback 录音就绪超时（${timeoutMs}ms）: ${stderr.trim()}`)),
-        timeoutMs
-      );
+      readyResolve = finishReady;
+      timer = setTimeout(() => {
+        try { child.kill(); } catch { /* ignore */ }
+        fail(new Error(`等待 loopback 录音就绪超时（${timeoutMs}ms）: ${stderr.trim()}`));
+      }, timeoutMs);
       child.on('close', (code) => {
-        clearTimeout(timer);
-        reject(new Error(`loopback 录音进程提前退出（${code}）: ${stderr.trim()}`));
+        fail(new Error(`loopback 录音进程提前退出（${code}）: ${stderr.trim()}`));
       });
     });
 

@@ -74,6 +74,12 @@ latency —— 测量音频输出 → 麦克风的声学延迟
 
 function parseArgs(argv) {
   const args = { times: 5, lead: 2.0, rate: DEFAULT_SAMPLE_RATE, guided: true };
+  const num = (name, v, { min = -Infinity, max = Infinity, integer = false } = {}) => {
+    if (!Number.isFinite(v)) throw new Error(`选项 ${name} 需要一个数字，收到: ${v}`);
+    if (integer && !Number.isInteger(v)) throw new Error(`选项 ${name} 需要整数，收到: ${v}`);
+    if (v < min || v > max) throw new Error(`选项 ${name} 超出允许范围 [${min}, ${max}]`);
+    return v;
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => argv[++i];
@@ -82,14 +88,14 @@ function parseArgs(argv) {
       case '--ffmpeg': args.ffmpeg = next(); break;
       case '--ffplay': args.ffplay = next(); break;
       case '--input': args.input = next(); break;
-      case '--times': args.times = parseInt(next(), 10); break;
-      case '--reference': args.reference = parseFloat(next()); break;
-      case '--lead': args.lead = parseFloat(next()); break;
-      case '--rate': args.rate = parseInt(next(), 10); break;
-      case '--min-quality': args.minQuality = parseFloat(next()); break;
-      case '--min-significance': args.minSignificance = parseFloat(next()); break;
+      case '--times': args.times = Number(next()); break;
+      case '--reference': args.reference = Number(next()); break;
+      case '--lead': args.lead = Number(next()); break;
+      case '--rate': args.rate = Number(next()); break;
+      case '--min-quality': args.minQuality = Number(next()); break;
+      case '--min-significance': args.minSignificance = Number(next()); break;
       case '--audio': args.audio = next(); break;
-      case '--playback-latency': args.playbackLatency = parseFloat(next()); break;
+      case '--playback-latency': args.playbackLatency = Number(next()); break;
       case '--keep': args.keep = true; break;
       case '--no-pause': args.noPause = true; break;
       case '--loopback': args.loopback = true; break;
@@ -101,6 +107,13 @@ function parseArgs(argv) {
         throw new Error(`未知选项: ${a}\n\n${HELP}`);
     }
   }
+  if (args.times != null) args.times = num('--times', args.times, { min: 1, integer: true });
+  if (args.reference != null) args.reference = num('--reference', args.reference, { min: 0 });
+  if (args.lead != null) args.lead = num('--lead', args.lead, { min: 0 });
+  if (args.rate != null) args.rate = num('--rate', args.rate, { min: 8000, integer: true });
+  if (args.minQuality != null) args.minQuality = num('--min-quality', args.minQuality, { min: 0, max: 1 });
+  if (args.minSignificance != null) args.minSignificance = num('--min-significance', args.minSignificance, { min: 1 });
+  if (args.playbackLatency != null) args.playbackLatency = num('--playback-latency', args.playbackLatency, { min: 0 });
   return args;
 }
 
@@ -120,17 +133,9 @@ async function main() {
   }
 
   const ffmpeg = args.ffmpeg || findFfmpeg();
-  const ffplay = args.ffplay || findFfplay();
-
   if (!ffmpeg) {
-    console.error('错误: 未找到 ffmpeg。请用 --ffmpeg <path> 指定，或设置环境变量 FFMPEG_PATH，' +
+    throw new Error('未找到 ffmpeg。请用 --ffmpeg <path> 指定，或设置环境变量 FFMPEG_PATH，' +
       '或将其放入 D:\\ffmpeg-master-latest-win64-gpl-shared\\bin。');
-    process.exit(1);
-  }
-  if (!ffplay) {
-    console.error('错误: 未找到 ffplay。请用 --ffplay <path> 指定，或设置环境变量 FFPLAY_PATH，' +
-      '或将其放入 D:\\ffmpeg-master-latest-win64-gpl-shared\\bin。');
-    process.exit(1);
   }
 
   if (args.list) {
@@ -145,13 +150,18 @@ async function main() {
     return;
   }
 
+  const ffplay = args.ffplay || findFfplay();
+  if (!ffplay) {
+    throw new Error('未找到 ffplay。请用 --ffplay <path> 指定，或设置环境变量 FFPLAY_PATH，' +
+      '或将其放入 D:\\ffmpeg-master-latest-win64-gpl-shared\\bin。');
+  }
+
   // 确定录音设备
   let inputDevice = args.input;
   if (!inputDevice) {
     const { inputs } = await listDevices(ffmpeg);
     if (inputs.length === 0) {
-      console.error('错误: 未找到麦克风设备。请用 --input <device> 指定。');
-      process.exit(1);
+      throw new Error('未找到麦克风设备。请用 --input <device> 指定。');
     }
     inputDevice = inputs[0];
     console.log(`未指定 --input，使用第一个麦克风: ${inputDevice}`);
@@ -161,7 +171,13 @@ async function main() {
   console.log('音频输出延迟测试');
   console.log('--------------------------------------------------');
   console.log(`  录音设备: ${inputDevice}`);
-  console.log(`  测量方式: ${args.loopback === false ? '含播放缓冲（旧模式）' : '自动（优先 loopback，否则扣偏移）'}`);
+  const modeText =
+    args.loopback === false
+      ? '含播放缓冲（旧模式）'
+      : args.loopback === true
+        ? '强制 loopback 双路'
+        : '自动（优先 loopback，否则含缓冲）';
+  console.log(`  测量方式: ${modeText}`);
   console.log(`  测试信号: ${args.audio ? `音频文件 ${args.audio}` : 'chirp 500~8000Hz'}`);
   console.log(`  采样率:   ${args.rate} Hz`);
   if (args.playbackLatency != null) console.log(`  扣除播放器开销: ${fmt(args.playbackLatency)}`);
@@ -171,8 +187,7 @@ async function main() {
   console.log('开始测量…\n');
 
   if (args.audio && !fs.existsSync(args.audio)) {
-    console.error(`错误: 音频文件不存在: ${args.audio}`);
-    process.exit(1);
+    throw new Error(`音频文件不存在: ${args.audio}`);
   }
 
   const cfg = {
@@ -184,19 +199,23 @@ async function main() {
   };
   if (args.audio) cfg.audioFile = args.audio;
   if (args.playbackLatency != null) cfg.playbackLatency = args.playbackLatency;
-  cfg.mode = args.loopback === false ? 'mic' : 'auto';
+  cfg.mode = args.loopback === false ? 'mic' : args.loopback === true ? 'loopback' : 'auto';
   if (args.minQuality != null) cfg.minQuality = args.minQuality;
   if (args.minSignificance != null) cfg.minSignificance = args.minSignificance;
 
-  // 引导式流程：每副设备自动测 5 次取中位数（仅交互终端）
+  // 引导式流程：每副设备自动测量并取中位数（仅交互终端）
   if (args.guided && process.stdin.isTTY && process.stdout.isTTY) {
+    if (args.reference != null) {
+      console.warn('提示: 引导式流程会自行测量有线基准，--reference 在此模式被忽略。');
+    }
     await guidedMeasure(cfg, args);
     return;
   }
 
   const stats = await measureRepeated(cfg, args.times, (i, r) => {
+    if (!args.printLatency) return;
     const sigText = r.significance != null ? `显著性 ${r.significance.toFixed(0)}` : '显著性 n/a';
-    const corrText = `相关 ${(r.quality * 100).toFixed(0)}%`;
+    const corrText = r.quality != null ? `相关 ${(r.quality * 100).toFixed(0)}%` : '相关 n/a';
     const peakText = r.peakDb != null ? `峰值 ${r.peakDb.toFixed(0)}dBFS` : '';
     console.log(
       `  #${String(i).padStart(2)}  延迟 ${r.valid ? fmt(r.roundTripMs) : '无效'}  (${sigText}  ${corrText}  ${peakText}${r.valid ? '' : ' ✗'})`
@@ -243,18 +262,16 @@ async function main() {
 
 /**
  * 引导式测量（通用，不限有线/蓝牙顺序）：
- *   每副设备自动测 5 次取中位数：
- *     - loopback 可用 → 延迟 = loopback 中位数，并更新播放缓冲偏移；
- *     - loopback 不可用 → 延迟 = 含缓冲中位数 − 已记录的偏移；
+ *   第一副（有线基准）：loopback 3 次取中位数，mic 3 次取含缓冲中位数，偏移 = 含缓冲 − 延迟。
+ *   之后每副设备：
+ *     - 先试 loopback（3 次），延迟合理直接采信；
+ *     - loopback 不可用（如蓝牙）→ mic 5 次取含缓冲中位数，延迟 = 含缓冲 − 偏移。
  *   每次列出：延迟、含缓冲、偏移。循环询问下一副。
  */
 async function guidedMeasure(cfg, args) {
   const keep = !!args.keep;
   const minQuality = cfg.minQuality ?? 0.05;
   const minSignificance = cfg.minSignificance ?? 20;
-
-  const isValid = (r) =>
-    r.quality >= minQuality && (r.significance ?? Infinity) >= minSignificance;
 
   const cleanup = (r) => {
     if (keep || !r || !r.files) return;
@@ -279,10 +296,56 @@ async function guidedMeasure(cfg, args) {
     for (const r of s.results || []) cleanup(r);
   };
 
+  // loopback 结果有效：mic 与 loop 两路都要可信，延迟还要在合理物理范围内
+  const loopbackOk = (r) =>
+    r.quality >= minQuality &&
+    (r.significance ?? Infinity) >= minSignificance &&
+    (r.loopQuality ?? 0) >= 0.5 &&
+    r.roundTripMs >= 5 &&
+    r.roundTripMs <= 500;
+
+  // 尝试 loopback 最多 tries 次，返回延迟中位数；不可用/全部不合理返回 null
+  const tryLoopbackMedian = async (tries) => {
+    const loopResults = [];
+    let consecutiveBad = 0;
+    for (let i = 0; i < tries; i++) {
+      let r = null;
+      try {
+        r = await measureOnce({ ...cfg, mode: 'loopback' });
+      } catch (err) {
+        if (err.message.startsWith('LOOPBACK_UNAVAILABLE')) break;
+        throw err;
+      }
+      if (loopbackOk(r)) {
+        loopResults.push(r);
+        consecutiveBad = 0;
+        if (args.printLatency) console.log(`  ${i + 1}/${tries}  延迟 ${fmt(r.roundTripMs)}`);
+      } else {
+        consecutiveBad++;
+      }
+      cleanup(r);
+      if (consecutiveBad >= 3) break;
+    }
+    if (loopResults.length === 0) return null;
+    const sorted = [...loopResults].sort((a, b) => a.roundTripMs - b.roundTripMs);
+    return sorted[Math.floor(sorted.length / 2)].roundTripMs;
+  };
+
+  // mic（含缓冲）测量 times 次，返回有效中位数
+  const runMicMedian = async (times, label) => {
+    const stats = await measureRepeated({ ...cfg, mode: 'mic' }, times, (i, r) => {
+      if (args.printLatency) {
+        console.log(`  ${i}/${times}  ${label} ${r.valid ? fmt(r.roundTripMs) : '无效'}`);
+      }
+    });
+    cleanupStats(stats);
+    return medianOf(stats.valid, null);
+  };
+
   console.log('==================================================');
   console.log('第一次测量请把有线耳机/扬声器设为默认播放设备，作为基准参考。\n');
 
-  let offsetMs = null; // 最近一次 loopback 可用设备测得的播放缓冲偏移
+  let offsetMs = null; // 基准设备测得的播放缓冲偏移（播放路径上游缓冲，与输出设备无关）
 
   let no = 1;
   while (true) {
@@ -299,68 +362,30 @@ async function guidedMeasure(cfg, args) {
     const isBaseline = no === 1;
 
     if (isBaseline) {
-      // 第一副：必须是有线基准。loopback 最多 5 次，连续 3 次不合理即放弃。
-      let loopResults = [];
-      let consecutiveBad = 0;
-      for (let i = 0; i < 5; i++) {
-        let r = null;
-        try {
-          r = await measureOnce({ ...cfg, mode: 'loopback' });
-        } catch (err) {
-          if (err.message.startsWith('LOOPBACK_UNAVAILABLE')) break;
-          throw err;
-        }
-        const ok =
-          r.quality >= minQuality &&
-          (r.significance ?? Infinity) >= minSignificance &&
-          (r.loopQuality ?? 0) >= 0.5 &&
-          r.roundTripMs >= 5 &&
-          r.roundTripMs <= 500;
-        if (ok) {
-          loopResults.push(r);
-          consecutiveBad = 0;
-          if (args.printLatency) console.log(`  ${i + 1}/5  延迟 ${fmt(r.roundTripMs)}`);
-        } else {
-          consecutiveBad++;
-        }
-        cleanup(r);
-        if (consecutiveBad >= 3) break;
-      }
-      if (loopResults.length) {
-        const sorted = [...loopResults].sort((a, b) => a.roundTripMs - b.roundTripMs);
-        delayMedian = sorted[Math.floor(sorted.length / 2)].roundTripMs;
-      }
+      // 第一副：必须是有线基准。loopback 最多 3 次，连续 3 次不合理即放弃。
+      delayMedian = await tryLoopbackMedian(3);
 
       if (delayMedian != null) {
-        // 基准的含缓冲：mic 5 次取中位数，建立偏移（此后不再更新）
+        // 基准的含缓冲：mic 3 次取中位数，建立偏移（此后不再更新）
         try {
-          const stats = await measureRepeated({ ...cfg, mode: 'mic' }, 5, (i, r) => {
-            if (args.printLatency) {
-              console.log(`  ${i}/5  延迟(含缓冲) ${r.valid ? fmt(r.roundTripMs) : '无效'}`);
-            }
-          });
-          buffMedian = medianOf(stats.valid, null);
-          cleanupStats(stats);
+          buffMedian = await runMicMedian(3, '延迟(含缓冲)');
         } catch (err) {
           console.log(`  含缓冲测量失败: ${err.message}`);
         }
         if (buffMedian != null) offsetMs = buffMedian - delayMedian;
       }
     } else {
-      // 后续设备：一律含缓冲 5 次，用第一副的偏移反推延迟
-      try {
-        const stats = await measureRepeated({ ...cfg, mode: 'mic' }, 5, (i, r) => {
-          if (args.printLatency) {
-            console.log(`  ${i}/5  延迟(含缓冲) ${r.valid ? fmt(r.roundTripMs) : '无效'}`);
+      // 后续设备：先试 loopback（3 次）；不可用/不合理时用 mic 5 次 + 已有偏移反推
+      delayMedian = await tryLoopbackMedian(3);
+      if (delayMedian == null) {
+        try {
+          buffMedian = await runMicMedian(5, '延迟(含缓冲)');
+          if (offsetMs != null && buffMedian != null) {
+            delayMedian = buffMedian - offsetMs;
           }
-        });
-        buffMedian = medianOf(stats.valid, null);
-        cleanupStats(stats);
-        if (offsetMs != null && buffMedian != null) {
-          delayMedian = buffMedian - offsetMs;
+        } catch (err) {
+          console.log(`  含缓冲测量失败: ${err.message}`);
         }
-      } catch (err) {
-        console.log(`  含缓冲测量失败: ${err.message}`);
       }
     }
 
@@ -438,6 +463,7 @@ async function run() {
     await main();
   } catch (err) {
     console.error('\n出错:', err.message);
+    process.exitCode = 1;
   }
   // 仅在“可执行文件（SEA exe）”运行时暂停（双击 exe 后窗口会关）；
   // 用 node 跑 js 文件时不暂停；且需交互终端、未 --no-pause。

@@ -1,10 +1,12 @@
 param(
   [string]$Out,
   [double]$Duration = 5,
-  [string]$CaptureName = ""
+  [string]$CaptureName = "",
+  [int]$SampleRate = 48000
 )
 # WASAPI dual capture: channel 0 = system render loopback, channel 1 = microphone.
-# Prints READY once both capture clients have started; writes a 48k stereo 16-bit WAV.
+# Prints READY once both capture clients have started; writes a stereo 16-bit WAV
+# at the requested sample rate (default 48000).
 
 $ErrorActionPreference = 'Stop'
 $src = @'
@@ -179,11 +181,11 @@ public static class LoopbackRec {
     }
   }
 
-  static float[] Resample(List<Packet> pkts, double t0, int outLen) {
+  static float[] Resample(List<Packet> pkts, double t0, int outLen, int sampleRate) {
     var o = new float[outLen];
     int p = 0;
     for (int i = 0; i < outLen; i++) {
-      double t = t0 + (double)i / 48000.0;
+      double t = t0 + (double)i / sampleRate;
       while (p < pkts.Count - 1 && t > pkts[p].End) p++;
       if (p >= pkts.Count) break;
       if (t < pkts[p].t0) continue;
@@ -226,7 +228,7 @@ public static class LoopbackRec {
     }
   }
 
-  public static int Run(string outPath, double duration, string captureName) {
+  public static int Run(string outPath, double duration, string captureName, int sampleRate) {
     var enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
     var iidAudioClient = new Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2");
     var iidCaptureClient = new Guid("C8ADBD64-E71E-48a0-A4DE-185C395CD317");
@@ -310,14 +312,14 @@ public static class LoopbackRec {
 
     double t0 = haveMicFirst ? (micFirstQpc / (double)qpcFreq) : 0.0;
 
-    int outLen = (int)(duration * 48000);
-    var left = Resample(lp, t0, outLen);
-    var right = Resample(mp, t0, outLen);
-    WriteWavStereo(outPath, left, right, 48000);
+    int outLen = (int)(duration * sampleRate);
+    var left = Resample(lp, t0, outLen, sampleRate);
+    var right = Resample(mp, t0, outLen, sampleRate);
+    WriteWavStereo(outPath, left, right, sampleRate);
     return 0;
   }
 }
 '@
 
 Add-Type -TypeDefinition $src
-[LoopbackRec]::Run($Out, $Duration, $CaptureName)
+[LoopbackRec]::Run($Out, $Duration, $CaptureName, $SampleRate)

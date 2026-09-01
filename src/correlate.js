@@ -64,6 +64,43 @@ export function nextPow2(x) {
 }
 
 /**
+ * 零相位 FFT 带通滤波：保留 [fLow, fHigh] 频段，抑制低频噪声和高频编码失真，
+ * 用于提高后续 NCC 波形相关的鲁棒性。滤波前后信号没有相位偏移，chirp 位置不变。
+ *
+ * @param {Float32Array|Array} signal
+ * @param {number} sampleRate
+ * @param {number} [fLow] 低端截止频率（Hz，默认 400）
+ * @param {number} [fHigh] 高端截止频率（Hz，默认 4000）
+ * @returns {Float32Array}
+ */
+export function bandpassFilter(signal, sampleRate, fLow = 400, fHigh = 4000) {
+  const n = signal.length;
+  if (n === 0) return new Float32Array(0);
+  const N = nextPow2(n);
+  const re = new Float64Array(N);
+  const im = new Float64Array(N);
+  for (let i = 0; i < n; i++) re[i] = signal[i];
+
+  fft(re, im, 1);
+
+  const binLow = Math.floor((fLow / sampleRate) * N);
+  const binHigh = Math.ceil((fHigh / sampleRate) * N);
+  for (let i = 0; i < N; i++) {
+    const bin = i <= N / 2 ? i : N - i;
+    if (bin < binLow || bin > binHigh) {
+      re[i] = 0;
+      im[i] = 0;
+    }
+  }
+
+  fft(re, im, -1);
+
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = re[i];
+  return out;
+}
+
+/**
  * 互相关：corr[k] = Σ signal[i] * template[i - k]
  * 当 template 在 signal 中从第 k 个样本开始出现时，corr[k] 达到峰值。
  *
@@ -286,10 +323,10 @@ export function resampleSegment(signal, templateLength, k, ratio) {
  * @param {Float32Array|Array} template
  * @param {number} k 模板在 signal 中的起点（样本）
  * @param {number} [ppm] 搜索范围（百万分之一，默认 200）
- * @param {number} [steps] 搜索步数（默认 41，约 10ppm 分辨率）
+ * @param {number} [steps] 搜索步数（默认 21，约 20ppm 分辨率）
  * @returns {{ ratio: number, quality: number }}
  */
-export function compensateRateOffsetNcc(signal, template, k, ppm = 200, steps = 41) {
+export function compensateRateOffsetNcc(signal, template, k, ppm = 200, steps = 21) {
   // PHAT 定位在有采样率偏移时会向漂移方向偏几个样本，因此除搜索 ratio 外，
   // 还要在 k 附近搜索一个小的整数样本修正量。
   const maxLag = Math.min(16, Math.ceil(template.length * ppm * 1e-6) + 4);

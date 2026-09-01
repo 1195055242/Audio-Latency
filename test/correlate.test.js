@@ -14,6 +14,7 @@ import {
   matchChirp,
   resampleSegment,
   compensateRateOffsetNcc,
+  bandpassFilter,
 } from '../src/correlate.js';
 
 test('fft: 逆变换能还原输入（round-trip）', () => {
@@ -185,4 +186,24 @@ test('compensateRateOffsetNcc 能补偿采样时钟偏移并提高相关', () =>
   assert.ok(comp.quality > plain, `补偿后相关应更高: comp=${comp.quality.toFixed(3)} plain=${plain.toFixed(3)}`);
   assert.ok(comp.quality > 0.9, `补偿后相关应接近 1: ${comp.quality.toFixed(3)}`);
   assert.ok(Math.abs(comp.ratio - r) < 3e-5, `估计重采样比应接近 ${r}: ${comp.ratio}`);
+});
+
+test('bandpassFilter 能抑制低频噪声和高频衰减，提高 NCC', () => {
+  const rate = 48000;
+  const chirp = generateChirp({ sampleRate: rate, duration: 0.5, f0: 500, f1: 8000 });
+
+  // 模拟蓝牙/扬声器：强低通 + 噪声 + 120Hz 低频嗡嗡声
+  const rec = new Float32Array(chirp.length);
+  rec.set(chirp);
+  iirLowpassInPlace(rec, 0, rec.length, 0.07); // 很狠的低通
+  addNoiseInPlace(rec, 0, rec.length, 0.25, 7);
+  for (let i = 0; i < rec.length; i++) rec[i] += 0.4 * Math.sin((2 * Math.PI * 120 * i) / rate);
+
+  const plain = demeanNcc(rec, chirp, 0);
+  const bpRec = bandpassFilter(rec, rate, 400, 4000);
+  const bpChirp = bandpassFilter(chirp, rate, 400, 4000);
+  const band = demeanNcc(bpRec, bpChirp, 0);
+
+  assert.ok(band > plain, `带通后 NCC 应更高: band=${band.toFixed(3)} plain=${plain.toFixed(3)}`);
+  assert.ok(band > 0.15, `带通后 NCC 应过 0.15: ${band.toFixed(3)}`);
 });

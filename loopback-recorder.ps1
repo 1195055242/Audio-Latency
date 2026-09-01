@@ -105,6 +105,8 @@ public static class LoopbackRec {
     public double t0;
     public float[] mono;
     public int rate;
+    public long qpcPos;
+    public long readQpc;
     public double End { get { return t0 + (double)mono.Length / rate; } }
   }
 
@@ -174,9 +176,10 @@ public static class LoopbackRec {
       long qpc;
       hr = cap.GetBuffer(out data, out frames, out flags, out devPos, out qpc);
       if (hr != 0) return;
+      long readQpc = Stopwatch.GetTimestamp();
       if (!haveFirst) { firstQpc = qpc; haveFirst = true; }
       float[] mono = ToMono(data, frames, fmt);
-      list.Add(new Packet { t0 = qpc / qpcPerSec, mono = mono, rate = (int)fmt.nSamplesPerSec });
+      list.Add(new Packet { t0 = qpc / qpcPerSec, mono = mono, rate = (int)fmt.nSamplesPerSec, qpcPos = qpc, readQpc = readQpc });
       cap.ReleaseBuffer(frames);
     }
   }
@@ -309,6 +312,23 @@ public static class LoopbackRec {
 
     Console.WriteLine("START_QPC " + micFirstQpc + " FREQ " + Stopwatch.Frequency);
     Console.Out.Flush();
+
+    // loop 通道 qpcPosition 可能带常量偏差（蓝牙渲染端点尤其明显），
+    // 直接用它会让 loop 通道整体推迟，导致 mic-loop 接近 0 或为负；
+    // 完全改用读包时刻又会引入 ±5ms 抖动，把 loop相关拉低。
+    // 这里用“读包时刻 - qpcPosition”的中位数作为常量校正量，
+    // 既保留 qpcPosition 的精细样本间隔，又消除常量时间偏差。
+    var loopOffsets = new List<double>();
+    foreach (var pkt in lp) {
+      if (pkt.qpcPos != 0 && pkt.readQpc != 0) loopOffsets.Add((double)(pkt.readQpc - pkt.qpcPos));
+    }
+    if (loopOffsets.Count > 0) {
+      loopOffsets.Sort();
+      double loopBiasQpc = loopOffsets[loopOffsets.Count / 2];
+      foreach (var pkt in lp) {
+        pkt.t0 = (pkt.qpcPos + loopBiasQpc) / qpcFreq;
+      }
+    }
 
     double t0 = haveMicFirst ? (micFirstQpc / (double)qpcFreq) : 0.0;
 

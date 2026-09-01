@@ -4,8 +4,34 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { generateChirp, writeWav, readWav, readWavChannels, DEFAULT_SAMPLE_RATE } from './signal.js';
-import { matchChirp, compensateRateOffsetNcc } from './correlate.js';
+import { matchChirp, compensateRateOffsetNcc, bandpassFilter } from './correlate.js';
 import { startRecording, startPlayback, decodeAudio, findLoopbackHelper, startLoopbackRecording } from './ffmpeg.js';
+
+const LOOPBACK_RETRY_DELAY_MS = 200; // 蓝牙链路唤醒/端点切换需要时间，100ms 不够
+const LOOPBACK_MAX_ATTEMPTS = 3;
+
+/**
+ * 带初始化重试的 loopback 单次测量。
+ *
+ * 蓝牙耳机常在 A2DP 休眠、重连、端点切换等瞬间报 LOOPBACK_UNAVAILABLE，
+ * 等一小段时间后重试往往就能成功。这里只对 LOOPBACK_UNAVAILABLE 重试，
+ * 其他错误（如采样率不一致、ffplay 失败）仍然直接抛出。
+ */
+async function measureLoopbackWithRetry(params) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= LOOPBACK_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await measureLoopbackOnce(params);
+    } catch (err) {
+      lastErr = err;
+      if (!err.message.startsWith('LOOPBACK_UNAVAILABLE') || attempt === LOOPBACK_MAX_ATTEMPTS) {
+        throw err;
+      }
+      await new Promise((resolve) => setTimeout(resolve, LOOPBACK_RETRY_DELAY_MS));
+    }
+  }
+  throw lastErr;
+}
 
 /**
  * loopback 单次测量：helper 同时抓“系统输出(loopback)”与“麦克风”，
@@ -22,6 +48,7 @@ async function measureLoopbackOnce({
   leadSilence,
   tailPad,
   compensateRate = true,
+  micLatency = 0,
 }) {
   const helperPath = findLoopbackHelper();
   if (!helperPath) {
@@ -80,14 +107,16 @@ async function measureLoopbackOnce({
   const micK = Math.round(micMatch.index + micMatch.offset);
   const loopMs = ((loopMatch.index + loopMatch.offset) / sampleRate) * 1000;
   const micMs = ((micMatch.index + micMatch.offset) / sampleRate) * 1000;
-  const roundTripMs = micMs - loopMs; // 延迟：输出→麦克风
+  const roundTripMs = micMs - loopMs - micLatency; // 延迟：输出→麦克风（扣除麦克风固有延迟）
 
-  // 采样时钟偏移补偿：在 ±200ppm 内搜索最佳重采样比，用补偿后的 NCC 作为相关质量
+  // 采样时钟偏移补偿：在 ±200ppm 内搜索最佳重采样比，用补偿后的 NCC 作为相关质量。
+  // 计算 NCC 前先做 400~4000Hz 带通，抑制低频噪声和高频编码失真，提高相关性鲁棒性。
+  const qualityTemplate = compensateRate ? bandpassFilter(template, sampleRate) : template;
   const loopQuality = compensateRate
-    ? compensateRateOffsetNcc(samples[0], template, loopK).quality
+    ? compensateRateOffsetNcc(bandpassFilter(samples[0], sampleRate), qualityTemplate, loopK).quality
     : loopMatch.quality;
   const quality = compensateRate
-    ? compensateRateOffsetNcc(samples[1], template, micK).quality
+    ? compensateRateOffsetNcc(bandpassFilter(samples[1], sampleRate), qualityTemplate, micK).quality
     : micMatch.quality;
 
   // 含缓冲：播放启动(ffplay 音频时钟)→麦克风，与延迟同一次播放得出
@@ -98,7 +127,7 @@ async function measureLoopbackOnce({
   } else {
     chirpPlayWall = play.startTime + leadSilence * 1000;
   }
-  const bufferedMs = startWall + micMs - chirpPlayWall;
+  const bufferedMs = startWall + micMs - chirpPlayWall - micLatency;
 
   let peak = 0;
   for (let i = 0; i < samples[1].length; i++) {
@@ -113,6 +142,7 @@ async function measureLoopbackOnce({
     quality,
     significance: micMatch.significance,
     loopQuality,
+    loopSignificance: loopMatch.significance,
     loopMs,
     micMs,
     peakDb,
@@ -134,6 +164,7 @@ async function measureLoopbackOnce({
  * @param {number} [cfg.leadSilence]     测试信号前导静音（秒），给播放启动留缓冲
  * @param {number} [cfg.tailPad]         播放结束后多录多久，覆盖链路延迟余量（秒）
  * @param {number} [cfg.playbackLatency]  播放器开销（ms），从往返延迟中扣除（ffplay/SDL 缓冲等）
+ * @param {number} [cfg.micLatency]       麦克风固有延迟（ms），从结果中扣除（如 USB 麦克风）
  * @param {'auto'|'loopback'|'mic'} [cfg.mode]  测量模式：loopback 双路 / mic 单路 / auto 自动回退（默认）
  * @param {string} [cfg.workDir]         临时文件目录
  * @returns {Promise<{ roundTripMs: number, quality: number, significance: number, peakDb: number, files: {chirp:string, rec:string} }>}
@@ -147,8 +178,9 @@ export async function measureOnce({
   audioFile = null,
   audioDuration = 2.0,
   leadSilence = 3.0,      // 覆盖 ffplay 启动 + 输出链路唤醒（蓝牙 A2DP 实测约 1.4s）
-  tailPad = 2.5,          // 播放结束后多录多久，覆盖链路延迟余量（秒）
+  tailPad = 1.0,          // 播放结束后多录多久，覆盖链路延迟余量（秒）
   playbackLatency = 0,    // 播放器开销（ffplay/SDL 音频缓冲），扣除后得纯声学往返
+  micLatency = 0,         // 麦克风固有延迟（如 USB 麦克风），从结果中扣除
   mode = 'auto',
   workDir = os.tmpdir(),
 } = {}) {
@@ -178,7 +210,7 @@ export async function measureOnce({
   const wantLoopback = mode === 'loopback' || mode === 'auto';
   if (wantLoopback) {
     try {
-      return await measureLoopbackOnce({
+      return await measureLoopbackWithRetry({
         ffmpegPath,
         ffplayPath,
         inputDevice,
@@ -189,6 +221,7 @@ export async function measureOnce({
         leadSilence,
         tailPad,
         compensateRate: !audioFile,
+        micLatency,
       });
     } catch (err) {
       if (mode === 'loopback' || !err.message.startsWith('LOOPBACK_UNAVAILABLE')) {
@@ -213,14 +246,13 @@ export async function measureOnce({
 
   let play = null;
   try {
-    // 2. 等麦克风真正开始采集（轮询数据区增长），而非固定延时
-    const recStarted = await rec.waitUntilStarted();
-
-    // 3. 启动播放。以麦克风开始采集的时刻（recStarted.time）作为录音基准；
-    //    用 ffplay 音频时钟（observeClock）在播放结束后精确推算 chirp 开始播放的时刻。
+    // 2. 提前启动播放，让 ffmpeg/dshow 的启动时间与播放前导静音重叠，缩短 mic 模式耗时；
+    //    同时等待麦克风真正开始采集（轮询数据区增长），以 recStarted.time 作为录音基准。
+    const startedPromise = rec.waitUntilStarted();
     play = startPlayback(ffplayPath, chirpPath, { observeClock: true });
+    const recStarted = await startedPromise;
 
-    // 4. 等待两者结束
+    // 3. 等待两者结束
     await play.promise;
     await rec.promise;
 
@@ -231,11 +263,16 @@ export async function measureOnce({
     }
 
     const match = matchChirp(recSamples, template);
-    // 采样时钟偏移补偿：chirp 模板在 ±200ppm 内搜索最佳重采样比，音频文件则保持原 NCC
+    // 采样时钟偏移补偿：chirp 模板在 ±200ppm 内搜索最佳重采样比，音频文件则保持原 NCC。
+    // 计算 NCC 前先做 400~4000Hz 带通，抑制低频噪声和高频编码失真。
     const matchK = Math.round(match.index + match.offset);
     const quality = audioFile
       ? match.quality
-      : compensateRateOffsetNcc(recSamples, template, matchK).quality;
+      : compensateRateOffsetNcc(
+          bandpassFilter(recSamples, sampleRate),
+          bandpassFilter(template, sampleRate),
+          matchK
+        ).quality;
 
     // 录音峰值电平（dBFS），用于诊断音量过低 / 麦克风增益 / 回声消除抑制
     let peak = 0;
@@ -263,7 +300,7 @@ export async function measureOnce({
     const tsOffsetMs = play.startTime - recStarted.time;
     // 端到端往返延迟 = chirp 到达墙钟 - chirp 播放墙钟 - 播放器额外开销
     // 剩余含 WASAPI 播放缓冲、麦克风采集缓冲与声学往返（--reference 差分可抵消系统偏置）。
-    const roundTripMs = arrivalWall - chirpPlayWall - (playbackLatency ?? 0);
+    const roundTripMs = arrivalWall - chirpPlayWall - (playbackLatency ?? 0) - (micLatency ?? 0);
 
     return {
       roundTripMs,
@@ -292,18 +329,18 @@ export async function measureOnce({
  * 有效性判据（以"峰值显著性"为主，而非逐点波形相关）：
  *   - significance >= minSignificance（默认 20）：证明录音里确实有测试信号，
  *     即使波形被回声消除/降噪/蓝牙编码扭曲，其时频结构仍保留，PHAT 峰依然尖锐。
- *   - quality >= minQuality（默认 0.15）：辅助防线，排除"显著性虚高但波形完全无关"
+ *   - quality >= minQuality（默认 0.10）：辅助防线，排除"显著性虚高但波形完全无关"
  *     的窄带/谐波干扰（这类干扰的波形相关值接近 0）。
  * 两者都满足才判定为有效，不参与统计的测量标记为无效。
  *
  * @param {object} cfg
- * @param {number} [cfg.minQuality] 波形相关质量阈值（0..1，默认 0.15）
+ * @param {number} [cfg.minQuality] 波形相关质量阈值（0..1，默认 0.10）
  * @param {number} [cfg.minSignificance] 峰值显著性阈值（默认 20）
  * @param {function} [cfg.onProgress] (i, result) => void
  * @returns {Promise<{ results: Array, valid: Array, medianMs, meanMs, stdMs, minMs, maxMs, validCount, total }>}
  */
 export async function measureRepeated(cfg, times = 5, onProgress) {
-  const minQuality = cfg.minQuality ?? 0.15;
+  const minQuality = cfg.minQuality ?? 0.10;
   const minSignificance = cfg.minSignificance ?? 20;
   const results = [];
   for (let i = 0; i < times; i++) {
@@ -325,14 +362,17 @@ export async function measureRepeated(cfg, times = 5, onProgress) {
       };
     }
     const isLoopback = r.loopQuality != null;
+    const loopEvident =
+      (r.loopQuality ?? 0) >= 0.9 ||
+      (r.loopSignificance ?? 0) >= 50 ||
+      (r.significance != null && r.quality != null && r.significance >= 50 && r.quality >= 0.5);
     r.valid =
       r.quality != null &&
       r.significance != null &&
       r.roundTripMs != null &&
       r.quality >= minQuality &&
       r.significance >= minSignificance &&
-      (!isLoopback ||
-        ((r.loopQuality ?? 0) >= 0.9 && r.roundTripMs >= 5 && r.roundTripMs <= 500));
+      (!isLoopback || (loopEvident && r.roundTripMs >= 5 && r.roundTripMs <= 500));
     results.push(r);
     if (onProgress) onProgress(i + 1, r);
   }

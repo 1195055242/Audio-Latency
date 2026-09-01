@@ -24,13 +24,18 @@
 
 播放缓冲完全在 loopback 参考点上游，**自动被排除**。
 
+loopback 初始化遇到 `LOOPBACK_UNAVAILABLE` 时会等待 800ms 重试（最多 3 次）；蓝牙 A2DP 休眠/重连/端点切换造成的瞬时失败通常能靠重试恢复，仍失败才判定不支持。
+
+loopback 通道的包时间戳以渲染端点 `qpcPosition` 为精细时间轴，再用“读包时刻 − qpcPosition”的中位数做常量校正：既消除蓝牙渲染端点 `qpcPosition` 的链路缓冲偏差，又避免读包时刻的 ±5ms 抖动拉低 loop 波形相关。
+
 ### 2. 麦克风模式（`mode: 'mic'`，含播放缓冲）
 
-- `ffmpeg -f dshow` 录音，`ffplay` 播放。
+- `ffmpeg -f dshow` 录音，`ffplay` 播放；播放与 ffmpeg/dshow 启动并行进行，用前导静音覆盖启动时间，缩短 mic 模式耗时。
 - 时间对齐（消除 ffplay 进程启动延迟）：
   - 录音侧：`recStarted.time`（采集开始检测）+ `arrivalMs`（chirp 在录音中的样本偏移）
   - 播放侧：用 ffplay `-stats` 音频时钟 `clockStart` 推算 `M = leadSilence` 的时刻，即 chirp 开始播放的墙钟时刻
 - 结果 = 播放缓冲 + 输出→麦克风，因此需要扣偏移或做差分。
+- 若使用 USB 麦克风等自带采集延迟的设备，可用 `--mic-latency <ms>` 扣除麦克风固有延迟。
 
 ## 信号检测（src/correlate.js）
 
@@ -39,10 +44,11 @@
 - `findPeak`：全局峰值 + 抛物线亚样本插值。
 - `demeanNcc`：去均值归一化相关，衡量波形相似度。
 - `resampleSegment` / `compensateRateOffsetNcc`：在 ±200ppm 内搜索最佳重采样比（并修正 PHAT 定位的少量样本偏移），补偿播放/录音采样时钟偏差后再算 NCC。
+- `bandpassFilter`：零相位 FFT 带通（默认 400~4000Hz），在 NCC 计算前抑制低频噪声和高频编码失真，提升相关性鲁棒性。
 - `peakSignificance`：峰值/本底 RMS，判断“确实有 chirp”。
 - `matchChirp`：一站式：PHAT 定位 + 质量 + 显著性。
 
-有效性判据（`measureRepeated`）：`significance ≥ 20`（默认）且 `quality ≥ 0.15`；loopback 结果还要求 `loopQuality ≥ 0.9` 且延迟在 5~500ms 的合理范围内。
+有效性判据（`measureRepeated`）：`significance ≥ 20`（默认）且 `quality ≥ 0.10`；loopback 结果还要求延迟在 5~500ms，且 loop 通道至少满足其一：`loopQuality ≥ 0.9`、`loopSignificance ≥ 50`、或 `mic significance ≥ 50 且 mic quality ≥ 0.5`。
 
 ## 引导式流程（index.js `guidedMeasure`）
 
@@ -50,7 +56,7 @@
 2. **每副设备**：
    - 先试 loopback，合理才采信；某次无效自动补测 1 次，连续 3 次无效即放弃；
    - 蓝牙等不可靠设备 → mic 模式，`延迟 = 含缓冲 − 偏移`。
-3. 目标是拿到 N 个有效值，N 默认 3、可用 `--times <n>` 覆盖；正常拿满取中位数，提前停止时对已有有效值取平均（全部无效按无效处理）。过程行默认不打印（`--print-latency` 开启，含每次测量的显著性/相关性）；汇总只输出 `延迟`，仅在 `--print-latency` 时括号列出含缓冲、偏移。
+3. 目标是拿到 N 个有效值，N 默认 3、可用 `--times <n>` 覆盖；正常拿满取中位数，提前停止时对已有有效值取平均（全部无效按无效处理）。loopback 至少需要 2 个有效值才采信，否则按“不支持 loopback”处理。过程行默认不打印（`--print-latency` 开启，含每次测量的显著性/相关性）；汇总只输出 `延迟`，仅在 `--print-latency` 时括号列出含缓冲、偏移。
 
 ## 关键文件
 

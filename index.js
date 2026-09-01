@@ -15,10 +15,11 @@
 //   --reference <ms>       参考基线（ms），用于计算输出链路净延迟
 //   --lead <seconds>       chirp 前导静音（默认 2.0，覆盖链路唤醒）
 //   --rate <hz>            采样率（默认 48000）
-//   --min-quality <q>      波形相关辅助阈值 0..1（默认 0.15）
+//   --min-quality <q>      波形相关辅助阈值 0..1（默认 0.10）
 //   --min-significance <s> 峰值显著性阈值（默认 20，主判据）
 //   --audio <file>         用音频文件代替 chirp 作为测试信号
 //   --playback-latency <ms> 播放器开销（ffplay/SDL 缓冲），从结果扣除
+//   --mic-latency <ms>      麦克风固有延迟（如 USB 麦克风），从结果扣除
 //   --loopback             WASAPI loopback 双路模式（输出→麦克风净延迟）
 //   --no-loopback         旧模式（播放启动→麦克风，含播放缓冲）
 //   --no-guided           关闭引导式流程（默认开启）
@@ -49,10 +50,11 @@ latency —— 测量音频输出 → 麦克风的声学延迟
   --reference <ms>    参考基线延迟（ms）。输出链路净延迟 = 测得值 - 基线
   --lead <seconds>    chirp 前导静音时长（默认 2.0，覆盖链路唤醒）
   --rate <hz>         采样率（默认 48000）
-  --min-quality <q>   波形相关辅助阈值 0..1（默认 0.15）
+  --min-quality <q>   波形相关辅助阈值 0..1（默认 0.10）
   --min-significance <s>  峰值显著性阈值（默认 20，主判据：录音中确有测试信号）
   --audio <file>      用音频文件（如简单音乐）代替 chirp 作为测试信号
   --playback-latency <ms>  播放器开销（ffplay/SDL 音频缓冲），从结果扣除
+  --mic-latency <ms>   麦克风固有延迟（如 USB 麦克风），从结果扣除
   --loopback         用 WASAPI loopback 双路测量“输出→麦克风”净延迟
   --no-loopback      旧模式：播放启动→麦克风（含播放缓冲，数值会偏大）
   --no-guided        关闭引导式流程（默认开启：每副设备自动测 3 次取中位数）
@@ -96,6 +98,7 @@ function parseArgs(argv) {
       case '--min-significance': args.minSignificance = Number(next()); break;
       case '--audio': args.audio = next(); break;
       case '--playback-latency': args.playbackLatency = Number(next()); break;
+      case '--mic-latency': args.micLatency = Number(next()); break;
       case '--keep': args.keep = true; break;
       case '--no-pause': args.noPause = true; break;
       case '--loopback': args.loopback = true; break;
@@ -114,6 +117,7 @@ function parseArgs(argv) {
   if (args.minQuality != null) args.minQuality = num('--min-quality', args.minQuality, { min: 0, max: 1 });
   if (args.minSignificance != null) args.minSignificance = num('--min-significance', args.minSignificance, { min: 1 });
   if (args.playbackLatency != null) args.playbackLatency = num('--playback-latency', args.playbackLatency, { min: 0 });
+  if (args.micLatency != null) args.micLatency = num('--mic-latency', args.micLatency, { min: 0 });
   return args;
 }
 
@@ -199,6 +203,7 @@ async function main() {
   };
   if (args.audio) cfg.audioFile = args.audio;
   if (args.playbackLatency != null) cfg.playbackLatency = args.playbackLatency;
+  if (args.micLatency != null) cfg.micLatency = args.micLatency;
   cfg.mode = args.loopback === false ? 'mic' : args.loopback === true ? 'loopback' : 'auto';
   if (args.minQuality != null) cfg.minQuality = args.minQuality;
   if (args.minSignificance != null) cfg.minSignificance = args.minSignificance;
@@ -272,7 +277,7 @@ async function main() {
 async function guidedMeasure(cfg, args) {
   const keep = !!args.keep;
   const tries = args.timesSet ? args.times : 3; // 引导式默认 3 次，--times 可覆盖
-  const minQuality = cfg.minQuality ?? 0.15;
+  const minQuality = cfg.minQuality ?? 0.10;
   const minSignificance = cfg.minSignificance ?? 20;
 
   const fmtSigCorr = (r) => {
@@ -289,13 +294,23 @@ async function guidedMeasure(cfg, args) {
     }
   };
 
-  // loopback 结果有效：mic 与 loop 两路都要可信，延迟还要在合理物理范围内
-  const loopbackOk = (r) =>
-    r.quality >= minQuality &&
-    (r.significance ?? Infinity) >= minSignificance &&
-    (r.loopQuality ?? 0) >= 0.9 &&
-    r.roundTripMs >= 5 &&
-    r.roundTripMs <= 500;
+  // loopback 结果有效：mic 与 loop 两路都要可信，延迟还要在合理物理范围内。
+  // loop 通道读包时刻时间戳会引入 ±5ms 抖动，loopQuality（波形 NCC）会偏低，
+  // 因此除了 loopQuality ≥ 0.9 外，还允许用 loop 通道自己的 PHAT 显著性，
+  // 或“mic 显著性>50 且 mic 相关>0.5”作为 loop 通道有效的旁证。
+  const loopbackOk = (r) => {
+    const loopEvident =
+      (r.loopQuality ?? 0) >= 0.9 ||
+      (r.loopSignificance ?? 0) >= 50 ||
+      (r.significance >= 50 && r.quality >= 0.5);
+    return (
+      r.quality >= minQuality &&
+      (r.significance ?? Infinity) >= minSignificance &&
+      loopEvident &&
+      r.roundTripMs >= 5 &&
+      r.roundTripMs <= 500
+    );
+  };
 
   // mic 结果有效：与 measureRepeated 相同的显著性 + 质量判据
   const micOk = (r) =>
@@ -311,7 +326,7 @@ async function guidedMeasure(cfg, args) {
    *   连续 3 次无效则停止，并对已有有效值取平均；全部无效返回 null。
    *   正常拿满 tries 个有效值时返回中位数（偶数取平均）。
    */
-  const measureWithRetry = async ({ mode, tries, isValid, label }) => {
+  const measureWithRetry = async ({ mode, tries, isValid, label, minValid = 1 }) => {
     const validResults = [];
     let consecutiveBad = 0;
     let attempt = 0;
@@ -335,7 +350,9 @@ async function guidedMeasure(cfg, args) {
       }
       if (args.printLatency) {
         const tag = attempt <= tries ? `${attempt}/${tries}` : `补测 ${attempt}/${tries}`;
-        const delay = ok ? fmt(r.roundTripMs) : '无效';
+        const delay = ok
+          ? fmt(r.roundTripMs)
+          : (r && r.roundTripMs != null ? `无效 (原始 ${fmt(r.roundTripMs)})` : '无效');
         const head = label ? `${label} ${delay}` : `延迟 ${delay}`;
         const metrics = r ? `(${fmtSigCorr(r)})` : '';
         console.log(`  ${tag}  ${head}  ${metrics}`);
@@ -343,7 +360,7 @@ async function guidedMeasure(cfg, args) {
       if (r) cleanup(r);
     }
 
-    if (validResults.length === 0) return null;
+    if (validResults.length < minValid) return null;
     if (validResults.length === tries) {
       const sorted = [...validResults].sort((a, b) => a.roundTripMs - b.roundTripMs);
       const mid = Math.floor(sorted.length / 2);
@@ -356,7 +373,7 @@ async function guidedMeasure(cfg, args) {
   };
 
   const tryLoopbackMedian = (tries) =>
-    measureWithRetry({ mode: 'loopback', tries, isValid: loopbackOk, label: '' });
+    measureWithRetry({ mode: 'loopback', tries, isValid: loopbackOk, label: '', minValid: Math.min(2, tries) });
 
   const runMicMedian = (times, label) =>
     measureWithRetry({ mode: 'mic', tries: times, isValid: micOk, label });
